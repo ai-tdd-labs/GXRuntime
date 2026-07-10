@@ -14,6 +14,13 @@ extern "C" {
 
 namespace dolruntime::aurora_recomp {
 
+// Replay-only physical aperture used to let the existing guest resolver carry
+// Dolphin's initial TMEM snapshot into CI texture packets. It is outside GC
+// MEM1 and remains an in-memory address identity; no .dolt guest memory record
+// uses this range.
+constexpr std::uint32_t kTmemSnapshotAddressBase = 0x1F000000u;
+constexpr std::uint32_t kTmemSnapshotMaxBytes = 0x00100000u;
+
 struct DrawTransformSnapshot {
   std::uint32_t transform_flags = 0;
   std::uint32_t current_pn_matrix = 0;
@@ -49,6 +56,11 @@ public:
   explicit RetailGxFrontend(const DolGuestAddressResolver& resolver);
 
   void reset(const DolGuestAddressResolver* resolver = nullptr);
+
+  // Installs the byte extent of a TMEM_SNAPSHOT record. The bytes remain owned
+  // by the replay context/resolver; this seeds snapshot-backed TLUT mappings as
+  // their BP texture state arrives.
+  bool restore_tmem_snapshot(std::uint32_t byte_size);
 
   bool set_vertex_layout(std::uint8_t vtx_fmt, std::uint32_t vertex_size);
   bool set_indexed_attr(std::uint8_t vtx_fmt, std::uint8_t attr,
@@ -111,6 +123,7 @@ private:
                     bool record_fifo_bytes, std::uint32_t depth,
                     std::size_t* consumed);
   bool handle_bp(std::uint32_t raw);
+  bool seed_snapshot_tlut(std::uint8_t slot);
   bool maybe_resolve_texture(std::uint8_t slot);
   bool handle_copy_trigger(std::uint32_t value);
   bool handle_draw(std::uint8_t command,
@@ -135,6 +148,7 @@ private:
 
   bool packet_drain_enabled_ = false;
   std::uint64_t zero_vertex_draws_ = 0;
+  std::uint32_t tmem_snapshot_size_ = 0;
   TraceEventObserver event_observer_ = nullptr;
   void* event_observer_user_ = nullptr;
   std::uint32_t emitted_trace_count_ = 0;

@@ -81,10 +81,11 @@ struct DffFrameSpec {
 
 // Serializes a v6 FifoDataFile: 128-byte header, frame list, BP/CP/XF/XFRegs
 // snapshots, then per-frame fifoData + memory-update lists (the same shapes
-// FifoDataFile::Save writes; TMEM omitted via texMemSize=0).
+// FifoDataFile::Save writes).
 std::vector<std::uint8_t> build_dff(const std::vector<DffFrameSpec>& frames,
                                     const std::uint32_t* cp_snapshot,
-                                    const std::uint32_t* xf_regs_snapshot) {
+                                    const std::uint32_t* xf_regs_snapshot,
+                                    const std::vector<std::uint8_t>& tmem = {}) {
   std::vector<std::uint8_t> out;
   out.resize(128u, 0u); // header patched at the end
   const std::size_t frame_list_offset = out.size();
@@ -102,6 +103,8 @@ std::vector<std::uint8_t> build_dff(const std::vector<DffFrameSpec>& frames,
   const std::size_t xf_regs_offset = out.size();
   for (std::uint32_t i = 0; i < 88u; ++i)
     put_le32(out, xf_regs_snapshot[i]);
+  const std::size_t tmem_offset = out.size();
+  out.insert(out.end(), tmem.begin(), tmem.end());
 
   for (std::size_t f = 0; f < frames.size(); ++f) {
     const DffFrameSpec& frame = frames[f];
@@ -150,8 +153,8 @@ std::vector<std::uint8_t> build_dff(const std::vector<DffFrameSpec>& frames,
   patch_le64(out, 60u, frame_list_offset);
   patch_le32(out, 68u, static_cast<std::uint32_t>(frames.size()));
   patch_le32(out, 72u, 0u);          // flags (GC)
-  patch_le64(out, 76u, 0u);          // texMemOffset
-  patch_le32(out, 84u, 0u);          // texMemSize (no TMEM snapshot)
+  patch_le64(out, 76u, tmem.empty() ? 0u : tmem_offset);
+  patch_le32(out, 84u, static_cast<std::uint32_t>(tmem.size()));
   patch_le32(out, 88u, kMem1Retail); // mem1_size
   patch_le32(out, 92u, 0x04000000u); // mem2_size
   std::memcpy(out.data() + 96u, "TESTDFF0", 8u);
@@ -272,6 +275,41 @@ void test_exram_update_skipped(const char* dolt_path) {
   assert(result.frames[0].draws == 1u);
 }
 
+void test_tmem_snapshot_preserved(const char* dolt_path) {
+  std::uint32_t cp[256];
+  std::uint32_t xf_regs[88];
+  snapshot_regs(cp, xf_regs);
+
+  std::vector<DffFrameSpec> frames(1u);
+  frames[0].fifo = build_draw_fifo();
+  const std::vector<std::uint8_t> tmem = {
+      0x00u, 0x11u, 0x00u, 0x33u, 0x44u, 0x00u, 0x66u, 0x77u,
+  };
+  const std::vector<std::uint8_t> dff_bytes =
+      build_dff(frames, cp, xf_regs, tmem);
+
+  dff::ConvertStats stats;
+  std::string error;
+  assert(dff::convert(dff_bytes.data(), dff_bytes.size(), dolt_path,
+                      dff::ConvertOptions{}, &stats, &error));
+  assert(stats.tmem_snapshot_bytes == tmem.size());
+  assert(stats.tmem_nonzero_bytes == 5u);
+
+  trace::TraceReader reader;
+  assert(reader.open(dolt_path));
+  trace::RecordView record;
+  assert(reader.next(record));
+  std::span<const std::uint8_t> restored;
+  assert(trace::decode_tmem_snapshot(record, restored));
+  assert(restored.size() == tmem.size());
+  assert(std::memcmp(restored.data(), tmem.data(), tmem.size()) == 0);
+
+  reader.rewind();
+  const replay::ReplayResult result = replay::replay_trace(reader);
+  assert(result.parse_ok);
+  assert(result.frames.size() == 1u);
+}
+
 void test_malformed_inputs() {
   dff::ConvertStats stats;
   std::string error;
@@ -299,11 +337,14 @@ void test_malformed_inputs() {
 int main() {
   const char* fixture_path = "dff2dolt_fixture.dolt";
   const char* exram_path = "dff2dolt_exram.dolt";
+  const char* tmem_path = "dff2dolt_tmem.dolt";
   test_two_frame_conversion(fixture_path);
   test_exram_update_skipped(exram_path);
+  test_tmem_snapshot_preserved(tmem_path);
   test_malformed_inputs();
   std::remove(fixture_path);
   std::remove(exram_path);
+  std::remove(tmem_path);
   std::printf("dff2dolt_tests passed\n");
   return 0;
 }

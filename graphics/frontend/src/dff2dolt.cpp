@@ -126,7 +126,8 @@ public:
                         kXfRegsSize, xf_regs_, error, "XF register snapshot"))
       return false;
 
-    // TMEM snapshot (v4+): only counted, never restored (see header comment).
+    // TMEM snapshot (v4+): Dolphin restores this outside the FIFO before
+    // replaying the register snapshot and frame stream.
     tmem_nonzero_ = 0;
     if (header_.version >= 4u && header_.tex_mem_size != 0u) {
       if (!range_ok(header_.tex_mem_offset, header_.tex_mem_size))
@@ -188,6 +189,11 @@ public:
   const std::uint32_t* xf_mem() const { return xf_mem_; }
   const std::uint32_t* xf_regs() const { return xf_regs_; }
   std::uint32_t tmem_nonzero() const { return tmem_nonzero_; }
+  std::span<const std::uint8_t> tmem() const {
+    if (header_.version < 4u || header_.tex_mem_size == 0u)
+      return {};
+    return {bytes_ + header_.tex_mem_offset, header_.tex_mem_size};
+  }
   const std::uint8_t* file_bytes() const { return bytes_; }
 
 private:
@@ -356,6 +362,8 @@ bool convert(const std::uint8_t* dff_bytes, std::size_t dff_size,
     *stats = ConvertStats{};
     stats->dff_version = dff.header().version;
     stats->frames = dff.header().frame_count;
+    stats->tmem_snapshot_bytes =
+        static_cast<std::uint32_t>(dff.tmem().size());
     stats->tmem_nonzero_bytes = dff.tmem_nonzero();
     std::memcpy(stats->game_id, dff.header().game_id, 8u);
   }
@@ -370,6 +378,10 @@ bool convert(const std::uint8_t* dff_bytes, std::size_t dff_size,
       *error = std::string("cannot open output ") + out_path;
     return false;
   }
+
+  const std::span<const std::uint8_t> tmem = dff.tmem();
+  if (!tmem.empty())
+    writer.tmem_snapshot(tmem.data(), static_cast<std::uint32_t>(tmem.size()));
 
   const std::vector<std::uint8_t> preamble = build_state_preamble(dff, stats);
   write_gx_run(writer, preamble.data(), preamble.size(), stats);

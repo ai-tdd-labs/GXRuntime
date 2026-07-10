@@ -34,6 +34,7 @@ enum class RecordKind : std::uint8_t {
   SetArray = 4,        // u8 attr | u32 guest_addr | u16 stride — HLE bridge record
   MemUpdate = 5,       // u32 guest_addr | u32 byte_size | bytes (resolved guest memory)
   PresentStats = 6,    // u32 frame_index | 9 x u32 AuroraStats fields
+  TmemSnapshot = 7,    // u32 byte_size | raw Dolphin TMEM bytes (initial state)
 };
 
 struct TraceHeader {
@@ -74,6 +75,7 @@ public:
                  std::uint16_t stride);
   void mem_update(std::uint32_t guest_addr, const void* bytes,
                   std::uint32_t byte_size);
+  void tmem_snapshot(const void* bytes, std::uint32_t byte_size);
   void present_stats(const PresentStats& stats);
 
   // Flushes and closes; returns false if any write failed at any point.
@@ -135,6 +137,8 @@ bool decode_set_array(const RecordView& r, std::uint8_t& attr,
                       std::uint32_t& guest_addr, std::uint16_t& stride);
 bool decode_mem_update(const RecordView& r, std::uint32_t& guest_addr,
                        std::span<const std::uint8_t>& bytes);
+bool decode_tmem_snapshot(const RecordView& r,
+                          std::span<const std::uint8_t>& bytes);
 bool decode_present_stats(const RecordView& r, PresentStats& out);
 
 } // namespace dolruntime::aurora_recomp::trace

@@ -55,6 +55,7 @@ std::uint64_t fnv1a(const std::uint8_t* data, std::size_t size) {
 
 struct CoreContext {
   std::vector<std::uint8_t> mem1;
+  std::vector<std::uint8_t> tmem;
   unsigned long long submitted = 0;
   unsigned long long submit_rejected = 0;
 };
@@ -65,6 +66,21 @@ bool mem1_resolver(void* user, u32 address, u32 size,
   auto* ctx = static_cast<CoreContext*>(user);
   if (out == nullptr || size == 0u)
     return false;
+  if (resource == DOL_GUEST_RESOURCE_TLUT &&
+      address >= ar::kTmemSnapshotAddressBase) {
+    const u32 offset = address - ar::kTmemSnapshotAddressBase;
+    if (offset >= ctx->tmem.size() || size > ctx->tmem.size() - offset)
+      return false;
+    *out = {
+        .data = ctx->tmem.data() + offset,
+        .address = address,
+        .size = size,
+        .available = static_cast<u32>(ctx->tmem.size() - offset),
+        .space = space,
+        .resource = resource,
+    };
+    return true;
+  }
   const u32 physical = dol_gx_recomp_guest_to_physical(address);
   if (physical >= ctx->mem1.size() || size > ctx->mem1.size() - physical)
     return false;
@@ -333,6 +349,21 @@ int dolgx_replay_core_main(const char* trace_path,
         break;
       }
       std::memcpy(ctx.mem1.data() + physical, bytes.data(), bytes.size());
+      break;
+    }
+    case trace::RecordKind::TmemSnapshot: {
+      std::span<const std::uint8_t> bytes;
+      if (!trace::decode_tmem_snapshot(record, bytes) ||
+          bytes.size() > ar::kTmemSnapshotMaxBytes) {
+        fail("malformed TMEM_SNAPSHOT");
+        break;
+      }
+      ctx.tmem.assign(bytes.begin(), bytes.end());
+      if (!frontend.restore_tmem_snapshot(
+              static_cast<std::uint32_t>(ctx.tmem.size())) ||
+          !frontend.flush(&sink)) {
+        fail("frontend rejected TMEM snapshot");
+      }
       break;
     }
     case trace::RecordKind::PresentStats: {

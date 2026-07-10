@@ -44,15 +44,23 @@ struct ReplayResult {
   std::vector<FrameDigest> frames;
 };
 
+using ReplayDrawObserver = void (*)(std::uint32_t frame_index,
+                                    std::uint32_t frame_draw,
+                                    const ConsumedDraw &draw,
+                                    unsigned long long cumulative_draw,
+                                    void *user);
+
 // Replays every record of a freshly opened (or rewound) reader. The optional
 // observer taps every frontend decode event (histograms).
-ReplayResult replay_trace(
-    trace::TraceReader& reader,
-    RetailGxFrontend::TraceEventObserver event_observer = nullptr,
-    void* event_observer_user = nullptr);
+ReplayResult
+replay_trace(trace::TraceReader &reader,
+             RetailGxFrontend::TraceEventObserver event_observer = nullptr,
+             void *event_observer_user = nullptr,
+             ReplayDrawObserver draw_observer = nullptr,
+             void *draw_observer_user = nullptr);
 
 // "frame N draws D zdraws Z verts V topo T store S elems E fnv X state H"
-std::string format_digest_line(const FrameDigest& f);
+std::string format_digest_line(const FrameDigest &f);
 
 struct StatsCompareResult {
   bool ok = false;
@@ -69,6 +77,6 @@ struct StatsCompareResult {
 // 4*draws+4 (Aurora pads each unmerged draw to 4 bytes). Transient rule: the
 // run fails only when more than 2 consecutive frames mismatch. Topology/
 // storage extents carry Aurora merge/cache caveats and are never gated.
-StatsCompareResult compare_against_stats(const ReplayResult& result);
+StatsCompareResult compare_against_stats(const ReplayResult &result);
 
 } // namespace dolruntime::aurora_recomp::replay

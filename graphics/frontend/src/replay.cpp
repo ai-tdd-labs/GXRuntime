@@ -14,15 +14,15 @@ namespace {
 constexpr std::uint64_t kFnvBasis = 1469598103934665603ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
 
-void fnv_bytes(std::uint64_t& hash, const void* data, std::size_t size) {
-  const auto* bytes = static_cast<const std::uint8_t*>(data);
+void fnv_bytes(std::uint64_t &hash, const void *data, std::size_t size) {
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
   for (std::size_t i = 0; i < size; ++i) {
     hash ^= bytes[i];
     hash *= kFnvPrime;
   }
 }
 
-void fnv_u32(std::uint64_t& hash, std::uint32_t value) {
+void fnv_u32(std::uint64_t &hash, std::uint32_t value) {
   for (unsigned i = 0; i < 4u; ++i) {
     hash ^= static_cast<std::uint8_t>(value >> (i * 8u));
     hash *= kFnvPrime;
@@ -31,18 +31,38 @@ void fnv_u32(std::uint64_t& hash, std::uint32_t value) {
 
 struct ReplayContext {
   std::vector<std::uint8_t> mem1;
+  std::vector<std::uint8_t> tmem;
   RetailGxFrontend frontend;
   ConsumingAuroraRenderSink sink;
   std::uint64_t content_fnv = kFnvBasis;
   std::uint64_t state_fnv = kFnvBasis;
+  std::uint32_t current_frame = 0;
+  std::uint32_t frame_draw = 0;
+  ReplayDrawObserver draw_observer = nullptr;
+  void *draw_observer_user = nullptr;
 };
 
-bool mem1_resolver(void* user, u32 address, u32 size,
+bool mem1_resolver(void *user, u32 address, u32 size,
                    DolGuestAddressSpace space, DolGuestResourceKind resource,
-                   DolGuestResolvedRange* out) {
-  auto* ctx = static_cast<ReplayContext*>(user);
+                   DolGuestResolvedRange *out) {
+  auto *ctx = static_cast<ReplayContext *>(user);
   if (out == nullptr || size == 0u)
     return false;
+  if (resource == DOL_GUEST_RESOURCE_TLUT &&
+      address >= kTmemSnapshotAddressBase) {
+    const u32 offset = address - kTmemSnapshotAddressBase;
+    if (offset >= ctx->tmem.size() || size > ctx->tmem.size() - offset)
+      return false;
+    *out = {
+        .data = ctx->tmem.data() + offset,
+        .address = address,
+        .size = size,
+        .available = static_cast<u32>(ctx->tmem.size() - offset),
+        .space = space,
+        .resource = resource,
+    };
+    return true;
+  }
   const u32 physical = dol_gx_recomp_guest_to_physical(address);
   if (physical >= ctx->mem1.size() || size > ctx->mem1.size() - physical)
     return false;
@@ -59,15 +79,15 @@ bool mem1_resolver(void* user, u32 address, u32 size,
 
 // Fold each span-complete draw into the frame's content/state digests. Runs
 // once per draw (on the next draw's arrival or at flush_assembly).
-void digest_draw_observer(const ConsumedDraw& draw, unsigned long long,
-                          void* user) {
-  auto* ctx = static_cast<ReplayContext*>(user);
+void digest_draw_observer(const ConsumedDraw &draw, unsigned long long,
+                          void *user) {
+  auto *ctx = static_cast<ReplayContext *>(user);
   fnv_bytes(ctx->content_fnv, draw.vertex_payload.data(),
             draw.vertex_payload.size());
   std::vector<AssembledElement> elements;
   const AssembledDrawStats stats = assemble_consumed_draw(draw, &elements);
   fnv_u32(ctx->content_fnv, stats.ok ? 1u : 0u);
-  for (const AssembledElement& element : elements) {
+  for (const AssembledElement &element : elements) {
     fnv_u32(ctx->content_fnv, element.attr);
     fnv_u32(ctx->content_fnv, element.vertex);
     fnv_u32(ctx->content_fnv, element.index);
@@ -84,35 +104,42 @@ void digest_draw_observer(const ConsumedDraw& draw, unsigned long long,
   fnv_bytes(ctx->state_fnv, draw.projection, sizeof draw.projection);
   fnv_bytes(ctx->state_fnv, draw.position_matrices,
             sizeof draw.position_matrices);
+  ++ctx->frame_draw;
+  if (ctx->draw_observer != nullptr) {
+    ctx->draw_observer(ctx->current_frame, ctx->frame_draw, draw,
+                       ctx->sink.draw_packets(), ctx->draw_observer_user);
+  }
 }
 
-std::string frontend_error_detail(const RetailGxFrontend& frontend) {
+std::string frontend_error_detail(const RetailGxFrontend &frontend) {
   char buf[160];
-  std::snprintf(buf, sizeof buf,
-                "%s (opcode=0x%02X offset=%zu detail=%u,%u,%u,%u)",
-                frontend.last_error() != nullptr ? frontend.last_error()
-                                                 : "unknown",
-                static_cast<unsigned>(frontend.last_error_opcode()),
-                frontend.last_error_offset(), frontend.last_error_a(),
-                frontend.last_error_b(), frontend.last_error_c(),
-                frontend.last_error_d());
+  std::snprintf(
+      buf, sizeof buf, "%s (opcode=0x%02X offset=%zu detail=%u,%u,%u,%u)",
+      frontend.last_error() != nullptr ? frontend.last_error() : "unknown",
+      static_cast<unsigned>(frontend.last_error_opcode()),
+      frontend.last_error_offset(), frontend.last_error_a(),
+      frontend.last_error_b(), frontend.last_error_c(),
+      frontend.last_error_d());
   return buf;
 }
 
 } // namespace
 
-ReplayResult replay_trace(trace::TraceReader& reader,
+ReplayResult replay_trace(trace::TraceReader &reader,
                           RetailGxFrontend::TraceEventObserver event_observer,
-                          void* event_observer_user) {
+                          void *event_observer_user,
+                          ReplayDrawObserver draw_observer,
+                          void *draw_observer_user) {
   ReplayResult result;
   auto ctx = std::make_unique<ReplayContext>();
   const std::uint32_t mem1_size =
       reader.header().mem1_size != 0u ? reader.header().mem1_size : 0x01800000u;
   ctx->mem1.assign(mem1_size, 0u);
+  ctx->draw_observer = draw_observer;
+  ctx->draw_observer_user = draw_observer_user;
 
   DolGuestAddressResolver resolver;
-  dol_guest_address_resolver_init_callback(&resolver, mem1_resolver,
-                                           ctx.get());
+  dol_guest_address_resolver_init_callback(&resolver, mem1_resolver, ctx.get());
   ctx->frontend.reset(&resolver);
   ctx->frontend.set_event_observer(event_observer, event_observer_user);
   ctx->frontend.set_packet_drain_enabled(true);
@@ -133,11 +160,11 @@ ReplayResult replay_trace(trace::TraceReader& reader,
   unsigned long long last_store = 0;
   unsigned long long last_elems = 0;
 
-  auto fail = [&](const std::string& message) {
+  auto fail = [&](const std::string &message) {
     result.parse_ok = false;
     char prefix[64];
-    std::snprintf(prefix, sizeof prefix, "record %llu frame %u: ",
-                  record_index, current_frame);
+    std::snprintf(prefix, sizeof prefix, "record %llu frame %u: ", record_index,
+                  current_frame);
     result.error = prefix + message;
   };
 
@@ -146,7 +173,7 @@ ReplayResult replay_trace(trace::TraceReader& reader,
   // by the backend close every frame with PRESENT_STATS; converted traces
   // (dff2dolt) carry no Aurora stats, so their frames close at the next
   // FRAME_BEGIN or at end-of-trace instead.
-  auto close_frame = [&](const trace::PresentStats* stats) {
+  auto close_frame = [&](const trace::PresentStats *stats) {
     ctx->sink.flush_assembly();
     FrameDigest digest;
     digest.frame_index = current_frame != 0u
@@ -189,6 +216,8 @@ ReplayResult replay_trace(trace::TraceReader& reader,
       if (frame_open)
         close_frame(nullptr);
       current_frame = frame_index;
+      ctx->current_frame = frame_index;
+      ctx->frame_draw = 0;
       frame_open = true;
       break;
     }
@@ -207,8 +236,7 @@ ReplayResult replay_trace(trace::TraceReader& reader,
         break;
       }
       for (unsigned i = 0; i < size; ++i)
-        bytes[i] =
-            static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
+        bytes[i] = static_cast<std::uint8_t>(value >> ((size - 1u - i) * 8u));
       if (!ctx->frontend.write_fifo({bytes, size}) ||
           !ctx->frontend.flush(&ctx->sink)) {
         fail("frontend rejected FIFO: " + frontend_error_detail(ctx->frontend));
@@ -262,6 +290,21 @@ ReplayResult replay_trace(trace::TraceReader& reader,
       std::memcpy(ctx->mem1.data() + physical, bytes.data(), bytes.size());
       break;
     }
+    case trace::RecordKind::TmemSnapshot: {
+      std::span<const std::uint8_t> bytes;
+      if (!trace::decode_tmem_snapshot(record, bytes) ||
+          bytes.size() > kTmemSnapshotMaxBytes) {
+        fail("malformed TMEM_SNAPSHOT");
+        break;
+      }
+      ctx->tmem.assign(bytes.begin(), bytes.end());
+      if (!ctx->frontend.restore_tmem_snapshot(
+              static_cast<std::uint32_t>(ctx->tmem.size())) ||
+          !ctx->frontend.flush(&ctx->sink)) {
+        fail("frontend rejected TMEM snapshot");
+      }
+      break;
+    }
     case trace::RecordKind::PresentStats: {
       trace::PresentStats stats{};
       if (!trace::decode_present_stats(record, stats)) {
@@ -285,7 +328,7 @@ ReplayResult replay_trace(trace::TraceReader& reader,
   return result;
 }
 
-std::string format_digest_line(const FrameDigest& f) {
+std::string format_digest_line(const FrameDigest &f) {
   char buf[208];
   std::snprintf(buf, sizeof buf,
                 "frame %u draws %llu zdraws %llu verts %llu topo %llu "
@@ -297,7 +340,7 @@ std::string format_digest_line(const FrameDigest& f) {
   return buf;
 }
 
-StatsCompareResult compare_against_stats(const ReplayResult& result) {
+StatsCompareResult compare_against_stats(const ReplayResult &result) {
   StatsCompareResult r;
   unsigned long long consecutive = 0;
   // AuroraStats are published by the render worker one present late
@@ -308,8 +351,8 @@ StatsCompareResult compare_against_stats(const ReplayResult& result) {
   // last frame has no partner and is ungated. Steady-state scenes are
   // shift-invariant; gameplay is not.
   for (std::size_t i = 0; i + 1 < result.frames.size(); ++i) {
-    const FrameDigest& f = result.frames[i];
-    const FrameDigest& next = result.frames[i + 1];
+    const FrameDigest &f = result.frames[i];
+    const FrameDigest &next = result.frames[i + 1];
     if (!next.has_stats)
       continue;
     if (next.frame_index != f.frame_index + 1u)
@@ -318,9 +361,8 @@ StatsCompareResult compare_against_stats(const ReplayResult& result) {
     const bool draw_match =
         f.draws + f.zero_draws == next.stats.draw_call_count;
     const unsigned long long slack = 4ull * f.draws + 4ull;
-    const bool vert_match =
-        next.stats.last_vert_size >= f.vert_bytes &&
-        (next.stats.last_vert_size - f.vert_bytes) <= slack;
+    const bool vert_match = next.stats.last_vert_size >= f.vert_bytes &&
+                            (next.stats.last_vert_size - f.vert_bytes) <= slack;
     if (draw_match && vert_match) {
       consecutive = 0;
       continue;

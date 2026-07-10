@@ -477,9 +477,8 @@ void test_unresolved_tlut_load_is_noop() {
   assert(saw_packet(sink, DOL_GX_RECOMP_EVENT_BP_REG));
   assert(!saw_packet(sink, DOL_GX_RECOMP_EVENT_TLUT));
 
-  // Converted .dff captures can also start from a TMEM snapshot without the
-  // paired LOAD_TLUT0 base register in the FIFO preamble. Keep decoding and
-  // leave the TLUT resource absent until snapshot restore exists.
+  // A raw FIFO without a restored TMEM snapshot can start without the paired
+  // LOAD_TLUT0 base register. Keep decoding and leave the TLUT absent.
   fifo.clear();
   push_bp(fifo, DOL_GX_BP_REG_LOAD_TLUT1, 0x00010300u);
   RetailGxFrontend missing_base_frontend;
@@ -616,6 +615,39 @@ int main() {
     cpu.ram[texture_base + i] = static_cast<std::uint8_t>(0x40u + i);
     cpu.ram[tlut_base + i] = static_cast<std::uint8_t>(0x20u + i);
     cpu.ram[copy_base + i] = static_cast<std::uint8_t>(0x60u + i);
+  }
+
+  // A DFF TMEM snapshot is restored before the synthesized BP preamble. The
+  // texture image state then identifies a C4 palette at BP TMEM offset 0x200;
+  // no LOAD_TLUT0/1 DMA command exists in the preamble, so the palette must be
+  // backed by the replay-only TMEM aperture.
+  {
+    RetailGxFrontend snapshot_frontend(resolver);
+    assert(snapshot_frontend.restore_tmem_snapshot(0x100000u));
+    std::vector<std::uint8_t> snapshot_fifo;
+    push_bp(snapshot_fifo, DOL_GX_BP_REG_TX_SETIMAGE0,
+            tex_image0(8u, 8u, 0x8u));
+    push_bp(snapshot_fifo, DOL_GX_BP_REG_TX_SETIMAGE3, texture_base >> 5u);
+    push_bp(snapshot_fifo, DOL_GX_BP_REG_TX_SETTLUT,
+            0x200u | (2u << 10u));
+    RecordingAuroraRenderSink snapshot_sink;
+    assert(snapshot_frontend.replay_fifo(snapshot_fifo, &snapshot_sink));
+    const auto& t = snapshot_frontend.state().tmem_tluts[0x200u];
+    assert(t.valid);
+    assert(t.entries == 16u);
+    assert(t.format == 2u);
+    assert(t.physical_base ==
+           dolruntime::aurora_recomp::kTmemSnapshotAddressBase + 0x40000u);
+    bool saw_snapshot_palette = false;
+    for (const auto& packet : snapshot_sink.packets()) {
+      if (packet.kind == RenderPacketKind::Resource &&
+          packet.resource.kind == RenderResourceKind::Texture &&
+          packet.resource.tlut_address == t.physical_base &&
+          packet.resource.tlut_entries == 16u) {
+        saw_snapshot_palette = true;
+      }
+    }
+    assert(saw_snapshot_palette);
   }
 
   std::vector<std::uint8_t> display_list;

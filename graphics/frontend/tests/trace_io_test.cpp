@@ -48,6 +48,8 @@ void write_reference_trace(const char* path, std::uint64_t* records_out) {
   writer.mem_update(0x80440000u, nullptr, 0); // 0-byte update is legal
   const auto big = pattern_bytes(70001, 0x42); // > 64 KB payload
   writer.mem_update(0x80500000u, big.data(), (std::uint32_t)big.size());
+  const auto tmem = pattern_bytes(1024, 0x71);
+  writer.tmem_snapshot(tmem.data(), static_cast<std::uint32_t>(tmem.size()));
   PresentStats stats{};
   stats.frame_index = 60;
   stats.queued_pipelines = 1;
@@ -117,6 +119,13 @@ void check_reference_records(TraceReader& reader) {
 
   have = reader.next(r);
   assert(have);
+  assert(decode_tmem_snapshot(r, bytes));
+  const auto tmem = pattern_bytes(1024, 0x71);
+  assert(bytes.size() == tmem.size());
+  assert(std::memcmp(bytes.data(), tmem.data(), tmem.size()) == 0);
+
+  have = reader.next(r);
+  assert(have);
   PresentStats stats{};
   assert(decode_present_stats(r, stats));
   assert(stats.frame_index == 60 && stats.draw_call_count == 9 &&
@@ -127,7 +136,7 @@ void check_reference_records(TraceReader& reader) {
 void test_round_trip() {
   std::uint64_t written = 0;
   write_reference_trace(kPath, &written);
-  assert(written == 9);
+  assert(written == 10);
 
   TraceReader reader;
   const bool opened = reader.open(kPath);
@@ -170,7 +179,7 @@ void test_truncated_tail() {
   while (reader.next(r))
     ++complete;
   assert(reader.truncated());
-  assert(complete == 8); // every record before the cut one
+  assert(complete == 9); // every record before the cut one
 }
 
 void test_bad_header() {

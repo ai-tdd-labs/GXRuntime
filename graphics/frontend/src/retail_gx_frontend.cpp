@@ -305,6 +305,7 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   draw_payload_head_ = 0u;
   draw_transform_head_ = 0u;
   zero_vertex_draws_ = 0u;
+  tmem_snapshot_size_ = 0u;
   emitted_trace_count_ = 0u;
   next_packet_sequence_ = 0u;
   last_error_ = nullptr;
@@ -314,6 +315,17 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   last_error_b_ = 0u;
   last_error_c_ = 0u;
   last_error_d_ = 0u;
+}
+
+bool RetailGxFrontend::restore_tmem_snapshot(std::uint32_t byte_size) {
+  if (byte_size > kTmemSnapshotMaxBytes)
+    return false;
+  tmem_snapshot_size_ = byte_size;
+  for (std::uint8_t slot = 0; slot < DOL_GX_RECOMP_TEXTURE_SLOTS; ++slot) {
+    if (!seed_snapshot_tlut(slot))
+      return false;
+  }
+  return true;
 }
 
 bool RetailGxFrontend::set_vertex_layout(std::uint8_t vtx_fmt,
@@ -702,7 +714,7 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
     state_.texture_tlut_tmem_offset[slot] =
         static_cast<std::uint16_t>(bp_get(value, 10u, 0u));
     state_.texture_tlut_format[slot] = bp_get(value, 2u, 10u);
-    return true;
+    return seed_snapshot_tlut(slot) && maybe_resolve_texture(slot);
   }
 
   switch (reg) {
@@ -739,6 +751,62 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
   }
 }
 
+bool RetailGxFrontend::seed_snapshot_tlut(std::uint8_t slot) {
+  if (tmem_snapshot_size_ == 0u || slot >= DOL_GX_RECOMP_TEXTURE_SLOTS ||
+      !state_.texture_tlut_valid[slot] || !state_.textures[slot].valid)
+    return true;
+
+  const std::uint32_t format = state_.textures[slot].format;
+  std::uint32_t entries = 0u;
+  switch (format) {
+  case 0x8u: // C4
+    entries = 16u;
+    break;
+  case 0x9u: // C8
+    entries = 256u;
+    break;
+  case 0xAu: // C14X2
+    entries = 16384u;
+    break;
+  default:
+    return true;
+  }
+
+  const std::uint16_t tmem_offset =
+      state_.texture_tlut_tmem_offset[slot];
+  // A FIFO LOAD_TLUT1 is newer than the initial snapshot and already points at
+  // the exact MEM1 DMA source. Never replace that live mapping with stale
+  // capture-start bytes.
+  const DolGxRecompTlut& existing = state_.tmem_tluts[tmem_offset];
+  if (existing.valid && existing.physical_base < kTmemSnapshotAddressBase)
+    return true;
+  // Dolphin's texMem snapshot indexes the BP TLUT offset directly in 512-byte
+  // units (the hardware-visible 0x80000 base is not present in the byte array).
+  const std::uint32_t byte_offset =
+      static_cast<std::uint32_t>(tmem_offset) * 512u;
+  const std::uint32_t byte_size = entries * 2u;
+  if (existing.valid && existing.byte_size >= byte_size)
+    return true;
+  if (byte_offset >= tmem_snapshot_size_ ||
+      byte_size > tmem_snapshot_size_ - byte_offset)
+    return true;
+
+  DolGxRecompTlut tlut{
+      .valid = true,
+      .slot = tmem_offset < DOL_GX_RECOMP_TLUT_SLOTS
+                  ? static_cast<std::uint8_t>(tmem_offset)
+                  : static_cast<std::uint8_t>(0xFFu),
+      .tmem_offset = tmem_offset,
+      .format = state_.texture_tlut_format[slot],
+      .entries = static_cast<std::uint16_t>(entries),
+      .physical_base = kTmemSnapshotAddressBase + byte_offset,
+      .byte_size = byte_size,
+      .range = {},
+  };
+  state_.tmem_tluts[tmem_offset] = tlut;
+  return true;
+}
+
 bool RetailGxFrontend::maybe_resolve_texture(std::uint8_t slot) {
   if (slot >= DOL_GX_RECOMP_TEXTURE_SLOTS)
     return false;
@@ -746,6 +814,8 @@ bool RetailGxFrontend::maybe_resolve_texture(std::uint8_t slot) {
   const std::uint8_t image3_reg = image3_reg_for_slot(slot);
   if (!state_.bp_valid[image0_reg] || !state_.bp_valid[image3_reg])
     return true;
+  if (!seed_snapshot_tlut(slot))
+    return false;
   DolGxRecompTexture texture;
   return dol_gx_recomp_resolve_texture_image(
       &state_, slot, state_.bp_regs[image0_reg], state_.bp_regs[image3_reg],

@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
   std::fprintf(stderr,
                "dff2dolt: %s -> %s game_id=%s dff_v%u frames=%u "
                "fifo_bytes=%llu gx_records=%llu mem_updates=%u "
-               "(%llu bytes) preamble bp=%u cp=%u xf_words=%u xf_regs=%u\n",
+               "(%llu bytes) tmem=%u bytes preamble bp=%u cp=%u xf_words=%u "
+               "xf_regs=%u\n",
                in_path, out_path,
                stats.game_id[0] != '\0' ? stats.game_id : "(unset)",
                stats.dff_version, stats.frames,
@@ -65,15 +66,11 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(stats.gx_records),
                stats.mem_updates,
                static_cast<unsigned long long>(stats.mem_update_bytes),
+               stats.tmem_snapshot_bytes,
                stats.preamble_bp_regs, stats.preamble_cp_regs,
                stats.preamble_xf_words, stats.preamble_xf_regs);
   if (stats.skipped_exram_updates != 0u)
     std::fprintf(stderr, "dff2dolt: WARNING skipped %u EXRAM memory updates\n",
                  stats.skipped_exram_updates);
-  if (stats.tmem_nonzero_bytes != 0u)
-    std::fprintf(stderr,
-                 "dff2dolt: note: TMEM snapshot has %u nonzero bytes that are "
-                 "NOT restored (v1 gap; see dff2dolt.hpp)\n",
-                 stats.tmem_nonzero_bytes);
   return 0;
 }

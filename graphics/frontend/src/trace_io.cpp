@@ -121,6 +121,12 @@ void TraceWriter::mem_update(std::uint32_t guest_addr, const void* bytes,
   write_record(RecordKind::MemUpdate, p, sizeof p, bytes, byte_size);
 }
 
+void TraceWriter::tmem_snapshot(const void* bytes, std::uint32_t byte_size) {
+  std::uint8_t p[4];
+  store_u32le(p, byte_size);
+  write_record(RecordKind::TmemSnapshot, p, sizeof p, bytes, byte_size);
+}
+
 void TraceWriter::present_stats(const PresentStats& stats) {
   std::uint8_t p[40];
   const std::uint32_t fields[10] = {
@@ -256,6 +262,17 @@ bool decode_mem_update(const RecordView& r, std::uint32_t& guest_addr,
   if (r.payload.size() - 8 != byte_size)
     return false;
   bytes = r.payload.subspan(8);
+  return true;
+}
+
+bool decode_tmem_snapshot(const RecordView& r,
+                          std::span<const std::uint8_t>& bytes) {
+  if (r.kind != RecordKind::TmemSnapshot || r.payload.size() < 4)
+    return false;
+  const std::uint32_t byte_size = load_u32le(r.payload.data());
+  if (r.payload.size() - 4 != byte_size)
+    return false;
+  bytes = r.payload.subspan(4);
   return true;
 }
 

@@ -15,12 +15,11 @@
 //                              emitted before the first FRAME_BEGIN, using
 //                              the exact command sequence + register
 //                              exclusion lists of FifoPlayer::LoadRegisters
+//   header TMEM snapshot    -> one TMEM_SNAPSHOT record before the preamble
 // No PRESENT_STATS records are written (Aurora ground truth does not exist
 // for a Dolphin recording); replay closes frames at FRAME_BEGIN/EOF instead.
 //
-// Not restored (v1 gaps, both logged in stats): TMEM snapshot (Dolphin
-// memcpys it outside the FIFO; not expressible as raw commands — S9 scenes
-// carry a near-empty snapshot) and FifoPlayer::ClearEfb's synthetic clear.
+// Not restored: FifoPlayer::ClearEfb's synthetic clear.
 
 #include <cstddef>
 #include <cstdint>
@@ -44,7 +43,8 @@ struct ConvertStats {
   std::uint32_t preamble_cp_regs = 0;
   std::uint32_t preamble_xf_words = 0; // XF memory words written (4096)
   std::uint32_t preamble_xf_regs = 0;
-  std::uint32_t tmem_nonzero_bytes = 0; // snapshot content we did NOT restore
+  std::uint32_t tmem_snapshot_bytes = 0;
+  std::uint32_t tmem_nonzero_bytes = 0;
   char game_id[9] = {};
 };
 
