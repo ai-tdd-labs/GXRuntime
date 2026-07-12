@@ -164,6 +164,16 @@ struct ParityWriter {
     bool valid = false;
     std::array<double, 3> object_min{};
     std::array<double, 3> object_max{};
+    std::array<double, 3> world_min{};
+    std::array<double, 3> world_max{};
+    std::array<double, 4> clip_min{};
+    std::array<double, 4> clip_max{};
+    std::array<double, 2> uv_min{};
+    std::array<double, 2> uv_max{};
+    std::uint64_t world_hash = 0;
+    std::uint64_t clip_hash = 0;
+    bool clip_rejected = false;
+    bool uv_valid = false;
     std::vector<std::array<double, 3>> world_samples;
     std::vector<std::array<double, 4>> clip_samples;
   };
@@ -325,6 +335,34 @@ struct ParityWriter {
     return std::isfinite(*out);
   }
 
+  // Keep the compact analyzer independent of host FMA contraction and loop
+  // unrolling.  DFF's source-side adapter rounds every binary32 product and
+  // addition explicitly; doing the same here prevents identical GX state
+  // from producing lane-dependent clip bounds on different host compilers.
+  static float round_f32(float value) {
+    volatile float rounded = value;
+    return rounded;
+  }
+
+  static float transform_row(const float *row, const std::array<float, 3> &v) {
+    const float p0 = round_f32(row[0] * v[0]);
+    const float p1 = round_f32(row[1] * v[1]);
+    const float p2 = round_f32(row[2] * v[2]);
+    const float s01 = round_f32(p0 + p1);
+    const float s012 = round_f32(s01 + p2);
+    return round_f32(s012 + row[3]);
+  }
+
+  static float project_two(float a, float x, float b, float y) {
+    const float p0 = round_f32(a * x);
+    const float p1 = round_f32(b * y);
+    return round_f32(p0 + p1);
+  }
+
+  static float project_bias(float a, float x, float bias) {
+    return round_f32(round_f32(a * x) + bias);
+  }
+
   static GeometryObservations
   observe_geometry(const DrawState &draw_state,
                    const dolruntime::aurora_recomp::ConsumedDraw &draw) {
@@ -363,7 +401,58 @@ struct ParityWriter {
       return result;
 
     const float *matrix = draw.position_matrices[draw.current_pn_matrix];
+    std::size_t tex0_offset = position_offset + 3u * value_size;
+    std::uint32_t tex0_type = 0u;
+    std::uint32_t tex0_fraction = 0u;
+    std::uint32_t tex0_components = 0u;
+    bool tex0_direct = false;
+    if (draw_state.vcd_valid[1]) {
+      const auto indexed_or_direct_size = [](std::uint32_t mode,
+                                             std::size_t direct_size) {
+        if (mode == 1u) return direct_size;
+        if (mode == 2u) return std::size_t{1};
+        if (mode == 3u) return std::size_t{2};
+        return std::size_t{0};
+      };
+      const std::uint32_t normal_mode = (vcd_lo >> 11u) & 3u;
+      if (normal_mode != 0u) {
+        const std::uint32_t normal_type = (vat_a >> 10u) & 7u;
+        const std::size_t normal_component_size = component_size(normal_type);
+        const std::size_t normal_components = ((vat_a >> 9u) & 1u) ? 9u : 3u;
+        tex0_offset += indexed_or_direct_size(
+            normal_mode, normal_component_size * normal_components);
+      }
+      const auto color_size = [](std::uint32_t format) -> std::size_t {
+        static constexpr std::size_t sizes[8] = {2u, 3u, 4u, 2u,
+                                                  3u, 4u, 0u, 0u};
+        return sizes[format & 7u];
+      };
+      const std::uint32_t color0_mode = (vcd_lo >> 13u) & 3u;
+      const std::uint32_t color1_mode = (vcd_lo >> 15u) & 3u;
+      tex0_offset += indexed_or_direct_size(
+          color0_mode, color_size((vat_a >> 14u) & 7u));
+      tex0_offset += indexed_or_direct_size(
+          color1_mode, color_size((vat_a >> 18u) & 7u));
+      const std::uint32_t tex0_mode = draw_state.vcd[1] & 3u;
+      tex0_type = (vat_a >> 22u) & 7u;
+      tex0_fraction = (vat_a >> 25u) & 0x1Fu;
+      tex0_components = ((vat_a >> 21u) & 1u) ? 2u : 1u;
+      tex0_direct = tex0_mode == 1u && component_size(tex0_type) != 0u &&
+                    tex0_offset + tex0_components * component_size(tex0_type) <=
+                        draw.vertex_size;
+    }
     bool have_bounds = false;
+    result.world_hash = 0xCBF29CE484222325ull;
+    result.clip_hash = 0xCBF29CE484222325ull;
+    auto mix_f32 = [](std::uint64_t &hash, float value) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &value, sizeof(bits));
+      for (unsigned shift = 0; shift < 32; shift += 8) {
+        hash ^= static_cast<std::uint8_t>(bits >> shift);
+        hash *= 1099511628211ull;
+      }
+    };
+    std::uint32_t shared_clip_mask = 0x3Fu;
     for (std::uint32_t vertex = 0; vertex < draw.vertex_count; ++vertex) {
       const std::size_t base =
           static_cast<std::size_t>(vertex) * draw.vertex_size +
@@ -379,6 +468,30 @@ struct ParityWriter {
           return GeometryObservations{};
         object[component] = decoded;
       }
+      if (tex0_direct) {
+        std::array<double, 2> uv{};
+        const std::size_t tex_component_size = component_size(tex0_type);
+        for (std::uint32_t component = 0; component < tex0_components; ++component) {
+          float decoded = 0.0f;
+          const std::size_t offset =
+              static_cast<std::size_t>(vertex) * draw.vertex_size + tex0_offset +
+              component * tex_component_size;
+          if (!decode_component(draw.vertex_payload.data() + offset,
+                                draw.vertex_payload.size() - offset, tex0_type,
+                                tex0_fraction, &decoded))
+            return GeometryObservations{};
+          uv[component] = decoded;
+        }
+        if (!result.uv_valid) {
+          result.uv_min = result.uv_max = uv;
+          result.uv_valid = true;
+        } else {
+          for (std::size_t axis = 0; axis < uv.size(); ++axis) {
+            result.uv_min[axis] = std::min(result.uv_min[axis], uv[axis]);
+            result.uv_max[axis] = std::max(result.uv_max[axis], uv[axis]);
+          }
+        }
+      }
       if (!have_bounds) {
         result.object_min = object;
         result.object_max = object;
@@ -391,30 +504,76 @@ struct ParityWriter {
               std::max(result.object_max[axis], object[axis]);
         }
       }
-      if (result.world_samples.size() >= 4u)
-        continue;
-      const std::array<double, 3> world = {
-          matrix[0] * object[0] + matrix[1] * object[1] +
-              matrix[2] * object[2] + matrix[3],
-          matrix[4] * object[0] + matrix[5] * object[1] +
-              matrix[6] * object[2] + matrix[7],
-          matrix[8] * object[0] + matrix[9] * object[1] +
-              matrix[10] * object[2] + matrix[11],
+      const std::array<float, 3> object_f = {
+          static_cast<float>(object[0]), static_cast<float>(object[1]),
+          static_cast<float>(object[2])};
+      const std::array<float, 3> world_f = {
+          transform_row(matrix + 0u, object_f),
+          transform_row(matrix + 4u, object_f),
+          transform_row(matrix + 8u, object_f),
       };
-      std::array<double, 4> clip{};
+      const std::array<double, 3> world = {
+          world_f[0], world_f[1], world_f[2]};
+      std::array<float, 4> clip_f{};
       if (draw.projection_type == 0u) {
-        clip = {
-            draw.projection[0] * world[0] + draw.projection[1] * world[2],
-            draw.projection[2] * world[1] + draw.projection[3] * world[2],
-            draw.projection[4] * world[2] + draw.projection[5], -world[2]};
+        clip_f = {
+            project_two(draw.projection[0], world_f[0], draw.projection[1],
+                        world_f[2]),
+            project_two(draw.projection[2], world_f[1], draw.projection[3],
+                        world_f[2]),
+            project_bias(draw.projection[4], world_f[2], draw.projection[5]),
+            round_f32(-world_f[2])};
       } else {
-        clip = {draw.projection[0] * world[0] + draw.projection[1],
-                draw.projection[2] * world[1] + draw.projection[3],
-                draw.projection[4] * world[2] + draw.projection[5], 1.0f};
+        clip_f = {
+            project_bias(draw.projection[0], world_f[0], draw.projection[1]),
+            project_bias(draw.projection[2], world_f[1], draw.projection[3]),
+            project_bias(draw.projection[4], world_f[2], draw.projection[5]),
+            1.0f};
       }
-      result.world_samples.push_back(world);
-      result.clip_samples.push_back(clip);
+      const std::array<double, 4> clip = {
+          clip_f[0], clip_f[1], clip_f[2], clip_f[3]};
+      for (float component : world_f)
+        mix_f32(result.world_hash, component);
+      for (float component : clip_f)
+        mix_f32(result.clip_hash, component);
+      result.clip_hash ^= 1u;
+      result.clip_hash *= 1099511628211ull;
+      if (vertex == 0u) {
+        result.world_min = result.world_max = world;
+        result.clip_min = result.clip_max = clip;
+      } else {
+        for (std::size_t axis = 0; axis < world.size(); ++axis) {
+          result.world_min[axis] = std::min(result.world_min[axis], world[axis]);
+          result.world_max[axis] = std::max(result.world_max[axis], world[axis]);
+        }
+        for (std::size_t axis = 0; axis < clip.size(); ++axis) {
+          result.clip_min[axis] = std::min(result.clip_min[axis], clip[axis]);
+          result.clip_max[axis] = std::max(result.clip_max[axis], clip[axis]);
+        }
+      }
+      std::uint32_t mask = 0u;
+      if (clip_f[3] - clip_f[0] < 0.0f) mask |= 0x01u;
+      if (clip_f[0] + clip_f[3] < 0.0f) mask |= 0x02u;
+      if (clip_f[3] - clip_f[1] < 0.0f) mask |= 0x04u;
+      if (clip_f[1] + clip_f[3] < 0.0f) mask |= 0x08u;
+      if (draw.projection_type != 0u && clip_f[2] > 0.000001f) mask |= 0x10u;
+      if (clip_f[2] + clip_f[3] < -0.000001f) mask |= 0x20u;
+      shared_clip_mask &= mask;
+      if (result.world_samples.size() < 4u) {
+        result.world_samples.push_back(world);
+        result.clip_samples.push_back(clip);
+      }
     }
+    const bool perspective = draw.projection_type == 0u;
+    const std::uint32_t z_raw =
+        draw_state.bp_valid[0x40u] ? draw_state.bp[0x40u] : 0u;
+    const bool hard_z = !perspective || (z_raw & 1u) != 0u ||
+                        (z_raw & 0x10u) != 0u;
+    const std::uint32_t hard_mask = (perspective ? 0x0Fu : 0u) |
+                                    (hard_z ? 0x30u : 0u);
+    result.clip_rejected =
+        (perspective && result.clip_max[3] <= 0.0) ||
+        (shared_clip_mask & hard_mask) != 0u;
     result.valid = have_bounds;
     return result;
   }
@@ -450,9 +609,17 @@ struct ParityWriter {
             : draw.texture;
     const GeometryObservations geometry = observe_geometry(draw_state, draw);
     std::string texture_hash;
+    std::string tlut_hash;
     if (texture_enabled && texture.resolved && texture.host_data != nullptr &&
         texture.size <= texture.host_available) {
       texture_hash = hex64(parity_fnv(texture.host_data, texture.size));
+    }
+    const std::size_t tlut_size =
+        static_cast<std::size_t>(texture.tlut_entries) * 2u;
+    if (texture_enabled && texture.has_tlut &&
+        texture.tlut_host_data != nullptr &&
+        tlut_size <= texture.tlut_host_available) {
+      tlut_hash = hex64(parity_fnv(texture.tlut_host_data, tlut_size));
     }
     std::string payload_hash = hex64(
         parity_fnv(draw.vertex_payload.data(), draw.vertex_payload.size()));
@@ -474,6 +641,8 @@ struct ParityWriter {
     nullable_u32(out, draw_state, 0x40u);
     out << ",\"alpha_test\":";
     nullable_u32(out, draw_state, 0xF3u);
+    out << ",\"pe_control\":";
+    nullable_u32(out, draw_state, 0x43u);
     out << ",\"scissor_tl\":";
     nullable_u32(out, draw_state, 0x20u);
     out << ",\"scissor_br\":";
@@ -517,10 +686,22 @@ struct ParityWriter {
           << ",\"format\":" << texture.format << ",\"width\":" << texture.width
           << ",\"height\":" << texture.height << ",\"source_hash\":"
           << (texture_hash.empty() ? "null" : json_string(texture_hash))
+          << ",\"source_hash_raw\":"
+          << (texture_hash.empty() ? "null" : json_string(texture_hash))
           << ",\"tlut\":"
           << (texture.has_tlut
                   ? std::to_string(texture.tlut_address & 0x03FFFFFFu)
-                  : "null");
+                  : "null")
+          << ",\"tlut_address_phys\":"
+          << (texture.has_tlut
+                  ? std::to_string(texture.tlut_address & 0x03FFFFFFu)
+                  : "null")
+          << ",\"tlut_format\":"
+          << (texture.has_tlut ? std::to_string(texture.tlut_format) : "null")
+          << ",\"tlut_entries\":"
+          << (texture.has_tlut ? std::to_string(texture.tlut_entries) : "null")
+          << ",\"tlut_source_hash\":"
+          << (tlut_hash.empty() ? "null" : json_string(tlut_hash));
     }
     out << "},\"matrix\":{\"projection_type\":";
     if ((draw.transform_flags &
@@ -530,10 +711,9 @@ struct ParityWriter {
     } else {
       out << "null,\"projection_coefficients\":null";
     }
-    // DFF stores the XF position-matrix index as a raw word offset. The
-    // replay frontend uses a normalized matrix slot internally, so convert it
-    // back here to keep the parity trace's wire format source-independent.
-    out << ",\"position_index\":" << (draw.current_pn_matrix * 3u)
+    // The parity schema uses a semantic 3x4 matrix slot. Keep GX's raw
+    // word-addressed PNMTX register encoding internal to the DFF decoder.
+    out << ",\"position_index\":" << draw.current_pn_matrix
         << ",\"position_values\":";
     if (draw.current_pn_matrix < DOL_GX_RECOMP_POSITION_MATRIX_COUNT &&
         (draw.position_matrix_valid_mask & (1u << draw.current_pn_matrix)) !=
@@ -549,12 +729,31 @@ struct ParityWriter {
       double_array(out, geometry.object_min);
       out << ",\"max\":";
       double_array(out, geometry.object_max);
-      out << "},\"world_samples\":";
+      out << "},\"world_bounds\":{\"min\":";
+      double_array(out, geometry.world_min);
+      out << ",\"max\":";
+      double_array(out, geometry.world_max);
+      out << "},\"world_hash\":" << json_string(hex64(geometry.world_hash))
+          << ",\"world_samples\":";
       double_rows(out, geometry.world_samples);
+      if (geometry.uv_valid) {
+        out << ",\"uv_bounds\":{\"min\":";
+        double_array(out, geometry.uv_min);
+        out << ",\"max\":";
+        double_array(out, geometry.uv_max);
+        out << "}";
+      }
     }
     out << "},\"post_clip\":{";
     if (geometry.valid) {
-      out << "\"clip_samples\":";
+      out << "\"clip_hash\":" << json_string(hex64(geometry.clip_hash))
+          << ",\"clip_bounds\":{\"min\":";
+      double_array(out, geometry.clip_min);
+      out << ",\"max\":";
+      double_array(out, geometry.clip_max);
+      out << "},\"clip_rejected\":"
+          << (geometry.clip_rejected ? "true" : "false")
+          << ",\"clip_samples\":";
       double_rows(out, geometry.clip_samples);
       out << ",\"projection_type\":" << draw.projection_type
           << ",\"derived_from\":\"gxruntime_direct_vertices\"";

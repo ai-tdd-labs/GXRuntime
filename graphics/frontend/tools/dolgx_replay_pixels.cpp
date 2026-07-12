@@ -23,6 +23,7 @@
 
 #include <aurora/gfx.h>
 #include <dolphin/gx.h>
+#include <dolphin/vi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -59,6 +60,14 @@ constexpr std::uint64_t kFnvPrime = 1099511628211ull;
 struct PixelContext {
   std::vector<std::uint8_t> mem1;
 };
+
+u32 pixel_window_dimension(const char* name, u32 fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0')
+    return fallback;
+  const unsigned long parsed = std::strtoul(raw, nullptr, 0);
+  return parsed >= 64u && parsed <= 4096u ? static_cast<u32>(parsed) : fallback;
+}
 
 bool mem1_resolver(void* user, u32 address, u32 size, DolGuestAddressSpace,
                    DolGuestResourceKind, const void** data, u32* available) {
@@ -213,8 +222,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // of each digest line.
   const AuroraBackendConfig config = {
       .app_name = "dolgx_replay",
-      .window_width = 1024,
-      .window_height = 768,
+      .window_width = pixel_window_dimension("DOLGX_PIXEL_WINDOW_WIDTH", 1024u),
+      .window_height = pixel_window_dimension("DOLGX_PIXEL_WINDOW_HEIGHT", 768u),
       .vsync = false,
       .allow_texture_dumps = false,
       .info_logging = false,
@@ -227,6 +236,12 @@ int dolgx_replay_pixels_main(const char* trace_path,
     std::fprintf(stderr, "dolgx_replay: aurora initialization failed\n");
     return 2;
   }
+  // Pixel parity needs an EFB-sized image, not a host-window/backing-scale
+  // dependent image (2048x1536 on a 2x Retina 1024x768 window). Aurora keeps
+  // the native presentation surface separate, so lock only the internal GX
+  // framebuffer to the canonical VI size when requested.
+  if (std::getenv("DOLGX_PIXEL_CANONICAL_EFB") != nullptr)
+    VISetFrameBufferScale(1.0f);
 
   // Canonical SDK baseline, exactly as a booting game establishes it before
   // any recording window opens. A windowed trace only carries the state its
@@ -237,6 +252,12 @@ int dolgx_replay_pixels_main(const char* trace_path,
   // SDK draw, so flush explicitly.
   static std::vector<std::uint8_t> gx_fifo(64u * 1024u);
   GXInit(gx_fifo.data(), static_cast<u32>(gx_fifo.size()));
+  if (std::getenv("DOLGX_PIXEL_CANONICAL_EFB") != nullptr) {
+    // VISetFrameBufferScale queues Aurora's resize for the next presentation.
+    // Consume that empty setup presentation before replay begins; otherwise
+    // frame 1 is hashed at the Retina backing size and frames 2+ at 640x480.
+    aurora_backend_present();
+  }
   GXFlush();
 
   std::vector<std::string> lines;
@@ -292,7 +313,8 @@ int dolgx_replay_pixels_main(const char* trace_path,
     if (!options.quiet)
       std::printf("%s\n", line);
     if (options.png_dir != nullptr &&
-        (options.png_every <= 1u || current_frame % options.png_every == 0u)) {
+        (current_frame == 1u || options.png_every <= 1u ||
+         current_frame % options.png_every == 0u)) {
       char path[1024];
       std::snprintf(path, sizeof path, "%s/frame_%05u.png", options.png_dir,
                     current_frame);
