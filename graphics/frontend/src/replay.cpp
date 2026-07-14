@@ -40,6 +40,8 @@ struct ReplayContext {
   std::uint32_t frame_draw = 0;
   ReplayDrawObserver draw_observer = nullptr;
   void *draw_observer_user = nullptr;
+  ReplayMemUpdateObserver mem_update_observer = nullptr;
+  void *mem_update_observer_user = nullptr;
 };
 
 bool mem1_resolver(void *user, u32 address, u32 size,
@@ -129,7 +131,9 @@ ReplayResult replay_trace(trace::TraceReader &reader,
                           RetailGxFrontend::TraceEventObserver event_observer,
                           void *event_observer_user,
                           ReplayDrawObserver draw_observer,
-                          void *draw_observer_user) {
+                          void *draw_observer_user,
+                          ReplayMemUpdateObserver mem_update_observer,
+                          void *mem_update_observer_user) {
   ReplayResult result;
   auto ctx = std::make_unique<ReplayContext>();
   const std::uint32_t mem1_size =
@@ -137,6 +141,8 @@ ReplayResult replay_trace(trace::TraceReader &reader,
   ctx->mem1.assign(mem1_size, 0u);
   ctx->draw_observer = draw_observer;
   ctx->draw_observer_user = draw_observer_user;
+  ctx->mem_update_observer = mem_update_observer;
+  ctx->mem_update_observer_user = mem_update_observer_user;
 
   DolGuestAddressResolver resolver;
   dol_guest_address_resolver_init_callback(&resolver, mem1_resolver, ctx.get());
@@ -288,6 +294,11 @@ ReplayResult replay_trace(trace::TraceReader &reader,
         break;
       }
       std::memcpy(ctx->mem1.data() + physical, bytes.data(), bytes.size());
+      if (ctx->mem_update_observer != nullptr) {
+        ctx->mem_update_observer(guest_addr,
+                                 static_cast<std::uint32_t>(bytes.size()),
+                                 ctx->mem_update_observer_user);
+      }
       break;
     }
     case trace::RecordKind::TmemSnapshot: {

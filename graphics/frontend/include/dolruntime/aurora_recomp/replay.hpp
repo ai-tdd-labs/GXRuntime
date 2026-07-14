@@ -49,15 +49,20 @@ using ReplayDrawObserver = void (*)(std::uint32_t frame_index,
                                     const ConsumedDraw &draw,
                                     unsigned long long cumulative_draw,
                                     void *user);
+using ReplayMemUpdateObserver = void (*)(std::uint32_t guest_address,
+                                         std::uint32_t size, void *user);
 
 // Replays every record of a freshly opened (or rewound) reader. The optional
-// observer taps every frontend decode event (histograms).
+// observers tap frontend decode events, completed draws, and validated MEM1
+// updates in trace order.
 ReplayResult
 replay_trace(trace::TraceReader &reader,
              RetailGxFrontend::TraceEventObserver event_observer = nullptr,
              void *event_observer_user = nullptr,
              ReplayDrawObserver draw_observer = nullptr,
-             void *draw_observer_user = nullptr);
+             void *draw_observer_user = nullptr,
+             ReplayMemUpdateObserver mem_update_observer = nullptr,
+             void *mem_update_observer_user = nullptr);
 
 // "frame N draws D zdraws Z verts V topo T store S elems E fnv X state H"
 std::string format_digest_line(const FrameDigest &f);

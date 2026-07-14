@@ -12,8 +12,10 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -102,7 +104,7 @@ constexpr std::uint32_t kTlutBase = 0x1000u;
 constexpr std::uint32_t kCopyBase = 0x1200u;
 constexpr std::uint32_t kMem1Size = 0x2000u;
 
-std::vector<std::uint8_t> build_display_list() {
+std::vector<std::uint8_t> build_display_list(bool enable_texture = false) {
   std::vector<std::uint8_t> dl;
   push_bp(dl, DOL_GX_BP_REG_GENMODE, 3u << 14u);
   push_bp(dl, DOL_GX_BP_REG_LOAD_TLUT0, kTlutBase >> 5u);
@@ -110,6 +112,8 @@ std::vector<std::uint8_t> build_display_list() {
   push_bp(dl, DOL_GX_BP_REG_TX_SETTLUT + 1u, 0x20u | (1u << 10u));
   push_bp(dl, DOL_GX_BP_REG_TX_SETIMAGE0 + 1u, tex_image0(16u, 8u, 1u));
   push_bp(dl, DOL_GX_BP_REG_TX_SETIMAGE3 + 1u, kTextureBase >> 5u);
+  if (enable_texture)
+    push_bp(dl, 0x28u, (1u << 6u) | 1u);
   push_bp(dl, DOL_GX_BP_REG_EFB_TL, 0u);
   push_bp(dl, DOL_GX_BP_REG_EFB_WH, (7u << 10u) | 7u);
   push_bp(dl, DOL_GX_BP_REG_EFB_ADDR, kCopyBase >> 5u);
@@ -303,16 +307,88 @@ void test_against_stats_gate_fails_on_sustained_mismatch(const char* path) {
   assert(!cmp.detail.empty());
 }
 
+void write_texture_provenance_trace(const char* path) {
+  const std::vector<std::uint8_t> dl = build_display_list(true);
+  const std::vector<std::uint8_t> fifo =
+      build_fifo(static_cast<std::uint32_t>(dl.size()));
+
+  trace::TraceWriter writer;
+  trace::TraceHeader header{};
+  std::memcpy(header.game_id, "TEXPROV0", 8u);
+  header.mem1_size = kMem1Size;
+  assert(writer.open(path, header));
+
+  writer.frame_begin(1u);
+  write_region(writer, kArrayBase, 0x10u);
+  write_region(writer, kXfArrayBase, 0x80u);
+  write_region(writer, kTlutBase, 0x20u);
+  write_region(writer, kCopyBase, 0x60u);
+  writer.mem_update(kDlOffset, dl.data(), static_cast<std::uint32_t>(dl.size()));
+  writer.set_array(0u, kArrayBase, 12u);
+  record_gx_writes(writer, fifo);
+  // The sink reports a completed draw when the following draw arrives. Put
+  // the explicit zero update between them so the first draw must retain the
+  // unresolved provenance it had at its own command boundary.
+  std::uint8_t zero_texture_half[64]{};
+  writer.mem_update(kTextureBase, zero_texture_half,
+                    sizeof zero_texture_half);
+  writer.call_display_list(0u, dl.data(), static_cast<std::uint32_t>(dl.size()));
+  writer.mem_update(kTextureBase + sizeof zero_texture_half,
+                    zero_texture_half, sizeof zero_texture_half);
+  writer.call_display_list(0u, dl.data(), static_cast<std::uint32_t>(dl.size()));
+  writer.present_stats(fixture_stats(1u));
+
+  assert(writer.close());
+  assert(writer.ok());
+}
+
+std::string shell_quote(const std::string& value) {
+  std::string quoted = "'";
+  for (const char c : value)
+    quoted += c == '\'' ? "'\\''" : std::string(1u, c);
+  return quoted + "'";
+}
+
+void test_texture_hash_requires_captured_mem1(const char* trace_path,
+                                              const char* parity_path) {
+  write_texture_provenance_trace(trace_path);
+  const std::string command =
+      shell_quote(DOLGX_REPLAY_TEST_PATH) + " " + shell_quote(trace_path) +
+      " --quiet --write-parity-jsonl " + shell_quote(parity_path);
+  assert(std::system(command.c_str()) == 0);
+
+  std::ifstream parity(parity_path);
+  assert(parity);
+  std::vector<std::string> draws;
+  std::string line;
+  while (std::getline(parity, line)) {
+    if (line.find("\"record\":\"draw\"") != std::string::npos)
+      draws.push_back(line);
+  }
+  assert(draws.size() == 3u);
+  assert(draws[0].find("\"source_hash\":null") != std::string::npos);
+  assert(draws[0].find("\"source_hash_raw\":null") != std::string::npos);
+  assert(draws[1].find("\"source_hash\":null") != std::string::npos);
+  assert(draws[1].find("\"source_hash_raw\":null") != std::string::npos);
+  assert(draws[2].find("\"source_hash\":\"0x") != std::string::npos);
+  assert(draws[2].find("\"source_hash_raw\":\"0x") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
   const char* fixture_path = "replay_digest_fixture.dolt";
   const char* negative_path = "replay_digest_negative.dolt";
+  const char* texture_path = "replay_texture_provenance.dolt";
+  const char* parity_path = "replay_texture_provenance.jsonl";
   write_fixture_trace(fixture_path);
   test_fixture_digest(fixture_path);
   test_against_stats_gate_fails_on_sustained_mismatch(negative_path);
+  test_texture_hash_requires_captured_mem1(texture_path, parity_path);
   std::remove(fixture_path);
   std::remove(negative_path);
+  std::remove(texture_path);
+  std::remove(parity_path);
   std::printf("replay_digest_tests passed\n");
   return 0;
 }

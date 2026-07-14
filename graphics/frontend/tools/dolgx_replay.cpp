@@ -18,6 +18,7 @@
 #include <deque>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -178,10 +179,34 @@ struct ParityWriter {
     std::vector<std::array<double, 4>> clip_samples;
   };
 
+  struct TextureSourceState {
+    bool valid = false;
+    std::uint32_t address = 0;
+    std::uint32_t size = 0;
+    std::uint32_t tlut_address = 0;
+    std::uint32_t tlut_size = 0;
+  };
+
+  struct DrawSourceAuthority {
+    std::array<bool, dolruntime::aurora_recomp::ConsumedDraw::kMaxTexmaps>
+        texture{};
+    std::array<bool, dolruntime::aurora_recomp::ConsumedDraw::kMaxTexmaps>
+        tlut{};
+  };
+
   std::ofstream out;
   DrawState state;
   std::deque<DrawState> pending_draw_states;
+  std::array<TextureSourceState,
+             dolruntime::aurora_recomp::ConsumedDraw::kMaxTexmaps>
+      texture_sources{};
+  std::deque<DrawSourceAuthority> pending_draw_sources;
   std::vector<ParityFrameRange> frames;
+  // A mid-frame DFF starts with a zero-filled replay buffer, not an
+  // authoritative MEM1 snapshot. Keep the byte ranges explicitly supplied by
+  // MEM_UPDATE separate from their current values so a real all-zero texture
+  // remains distinguishable from never-captured memory.
+  std::map<std::uint32_t, std::uint32_t> initialized_mem1;
 
   ParityWriter(const char *path, const char *trace_path, const char *game_id)
       : out(path, std::ios::trunc) {
@@ -207,12 +232,67 @@ struct ParityWriter {
                event.b < state.vat[event.a].size()) {
       state.vat[event.a][event.b] = event.c;
       state.vat_valid[event.a][event.b] = true;
+    } else if (event.kind == DOL_GX_RECOMP_EVENT_TEXTURE &&
+               event.a < texture_sources.size()) {
+      texture_sources[event.a] = {
+          .valid = true,
+          .address = event.b,
+          .size = event.c,
+          .tlut_address = event.tlut_address,
+          .tlut_size = event.tlut_entries * 2u,
+      };
     } else if (event.kind == DOL_GX_RECOMP_EVENT_DRAW) {
       // ConsumingAuroraRenderSink completes a draw when the following draw
       // arrives. Queue the command-boundary state so the delayed draw callback
       // cannot accidentally observe BP/CP writes belonging to its successor.
       pending_draw_states.push_back(state);
+      DrawSourceAuthority sources;
+      for (std::size_t slot = 0; slot < texture_sources.size(); ++slot) {
+        const TextureSourceState &source = texture_sources[slot];
+        if (!source.valid)
+          continue;
+        sources.texture[slot] = has_mem1_bytes(source.address, source.size);
+        sources.tlut[slot] =
+            source.tlut_address >=
+                dolruntime::aurora_recomp::kTmemSnapshotAddressBase ||
+            has_mem1_bytes(source.tlut_address, source.tlut_size);
+      }
+      pending_draw_sources.push_back(sources);
     }
+  }
+
+  void observe_mem_update(std::uint32_t guest_address, std::uint32_t size) {
+    if (size == 0u)
+      return;
+    std::uint32_t begin = dol_gx_recomp_guest_to_physical(guest_address);
+    std::uint32_t end = begin + size;
+    auto next = initialized_mem1.lower_bound(begin);
+    if (next != initialized_mem1.begin()) {
+      auto previous = std::prev(next);
+      if (previous->second >= begin) {
+        begin = previous->first;
+        end = std::max(end, previous->second);
+        next = initialized_mem1.erase(previous);
+      }
+    }
+    while (next != initialized_mem1.end() && next->first <= end) {
+      end = std::max(end, next->second);
+      next = initialized_mem1.erase(next);
+    }
+    initialized_mem1.emplace(begin, end);
+  }
+
+  bool has_mem1_bytes(std::uint32_t guest_address, std::uint32_t size) const {
+    if (size == 0u)
+      return false;
+    const std::uint32_t begin =
+        dol_gx_recomp_guest_to_physical(guest_address);
+    const std::uint32_t end = begin + size;
+    auto range = initialized_mem1.upper_bound(begin);
+    if (range == initialized_mem1.begin())
+      return false;
+    --range;
+    return range->first <= begin && range->second >= end;
   }
 
   static void nullable_u32(std::ostream &stream, const DrawState &draw_state,
@@ -587,6 +667,11 @@ struct ParityWriter {
         pending_draw_states.empty() ? state : pending_draw_states.front();
     if (!pending_draw_states.empty())
       pending_draw_states.pop_front();
+    DrawSourceAuthority draw_sources;
+    if (!pending_draw_sources.empty()) {
+      draw_sources = pending_draw_sources.front();
+      pending_draw_sources.pop_front();
+    }
     if (frames.empty() || frames.back().frame != frame) {
       frames.push_back({.frame = frame,
                         .first_draw = cumulative_draw,
@@ -610,13 +695,20 @@ struct ParityWriter {
     const GeometryObservations geometry = observe_geometry(draw_state, draw);
     std::string texture_hash;
     std::string tlut_hash;
-    if (texture_enabled && texture.resolved && texture.host_data != nullptr &&
+    const bool texture_source_captured =
+        texture_slot < draw_sources.texture.size() &&
+        draw_sources.texture[texture_slot];
+    if (texture_enabled && texture_source_captured && texture.resolved &&
+        texture.host_data != nullptr &&
         texture.size <= texture.host_available) {
       texture_hash = hex64(parity_fnv(texture.host_data, texture.size));
     }
     const std::size_t tlut_size =
         static_cast<std::size_t>(texture.tlut_entries) * 2u;
+    const bool tlut_source_captured = texture_slot < draw_sources.tlut.size() &&
+                                      draw_sources.tlut[texture_slot];
     if (texture_enabled && texture.has_tlut &&
+        tlut_source_captured &&
         texture.tlut_host_data != nullptr &&
         tlut_size <= texture.tlut_host_available) {
       tlut_hash = hex64(parity_fnv(texture.tlut_host_data, tlut_size));
@@ -819,6 +911,11 @@ void cli_draw_observer(std::uint32_t frame_index, std::uint32_t frame_draw,
                        unsigned long long cumulative_draw, void *user) {
   static_cast<ParityWriter *>(user)->observe_draw(frame_index, frame_draw, draw,
                                                   cumulative_draw);
+}
+
+void cli_mem_update_observer(std::uint32_t guest_address, std::uint32_t size,
+                             void *user) {
+  static_cast<ParityWriter *>(user)->observe_mem_update(guest_address, size);
 }
 
 void histogram_observe(const DolGxRecompTraceEvent &event, void *user) {
@@ -1093,7 +1190,8 @@ int main(int argc, char **argv) {
   };
   const replay::ReplayResult result = replay::replay_trace(
       reader, (histogram || parity) ? cli_event_observer : nullptr, &observers,
-      parity ? cli_draw_observer : nullptr, parity.get());
+      parity ? cli_draw_observer : nullptr, parity.get(),
+      parity ? cli_mem_update_observer : nullptr, parity.get());
   if (result.truncated)
     std::fprintf(stderr, "dolgx_replay: trace ends mid-record (interrupted "
                          "recording); replayed the complete prefix\n");

@@ -106,6 +106,11 @@ if(BUILD_TESTING)
         PRIVATE
             DolRuntime::replay_core
     )
+    target_compile_definitions(replay_digest_tests
+        PRIVATE
+            DOLGX_REPLAY_TEST_PATH="$<TARGET_FILE:dolgx_replay>"
+    )
+    add_dependencies(replay_digest_tests dolgx_replay)
     add_test(NAME replay_digest_tests COMMAND replay_digest_tests)
 
     add_executable(dff2dolt_tests
